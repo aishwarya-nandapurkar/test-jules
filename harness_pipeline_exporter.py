@@ -13,7 +13,8 @@
 #    (Optional) export HARNESS_API_BASE_URL="your_on_prem_harness_url" # If not using SaaS
 # 3. Run the script: `python harness_pipeline_exporter.py`
 # 4. If environment variables are not set, you will be prompted to enter them.
-# 5. A CSV file named `harness_pipelines_report.csv` will be generated in the same directory.
+# 5. A CSV file named `harness_pipelines_report.csv` will be generated,
+#    containing columns: Organization, Project, Pipeline Count.
 
 import requests
 import csv
@@ -287,6 +288,61 @@ def get_pipelines(api_base_url, headers, account_id, org_identifier, project_ide
     return all_pipelines
 
 
+def get_pipeline_count(api_base_url, headers, account_id, org_identifier, project_identifier):
+    """
+    Fetches the count of pipelines for a given project within an organization.
+    It attempts to do this by making a minimal request and checking for total item count
+    in the response metadata.
+    """
+    url = f"{api_base_url}/ng/api/pipelines"
+    print(f"Fetching pipeline count for project: {project_identifier} in org: {org_identifier}...")
+
+    params = {
+        "accountIdentifier": account_id,
+        "orgIdentifier": org_identifier,
+        "projectIdentifier": project_identifier,
+        "page": 0,  # First page
+        "size": 1   # Minimal size, we only need metadata
+    }
+
+    response_data = make_api_request(url, headers, params)
+
+    if response_data and "data" in response_data:
+        # Harness NG APIs typically provide total item count in 'totalItems' or 'totalElements'
+        # within the 'data' object when pagination is involved.
+        if "totalItems" in response_data["data"]:
+            count = response_data["data"]["totalItems"]
+            print(f"Successfully fetched pipeline count: {count} for project: {project_identifier}.")
+            return count
+        elif "totalElements" in response_data["data"]: # Another common key for total count
+            count = response_data["data"]["totalElements"]
+            print(f"Successfully fetched pipeline count: {count} for project: {project_identifier}.")
+            return count
+        elif "content" in response_data["data"] and isinstance(response_data["data"]["content"], list):
+            # Fallback: if totalItems isn't there, but we got a content list (even if small due to size=1)
+            # and if there's no totalPages or a very small one, this might be a small project.
+            # For a more accurate count if metadata is missing, we'd have to paginate fully.
+            # However, for this optimization, we'll check if it's the only page.
+            total_pages = response_data.get("data", {}).get("totalPages", 0)
+            if total_pages <= 1: # If totalPages is 0 or 1, the current page content length is the count
+                count = len(response_data["data"]["content"])
+                print(f"Fetched pipeline count (fallback using content length on single page): {count} for project: {project_identifier}.")
+                return count
+            else:
+                # If totalPages > 1 and no totalItems/totalElements, we'd have to iterate all pages.
+                # For this function's purpose (optimized count), we'll indicate this requires full fetch.
+                print(f"Warning: Pipeline count metadata (totalItems/totalElements) not found for project {project_identifier}, and multiple pages exist. Full pagination would be needed for exact count. Returning -1 (or consider fetching all).")
+                # To get an exact count in this scenario, you would call the original get_pipelines and get its length.
+                # For simplicity in this modification, we'll return a marker or could call get_pipelines.
+                # Let's call the original get_pipelines and return its length as a robust fallback.
+                print(f"Performing full fetch for project {project_identifier} to get accurate count...")
+                all_pipelines_list = get_pipelines(api_base_url, headers, account_id, org_identifier, project_identifier) # Call original
+                return len(all_pipelines_list)
+
+    print(f"Warning: Could not determine pipeline count for project {project_identifier}. Response: {response_data}")
+    return 0 # Default to 0 if count cannot be determined
+
+
 # --- Main Script Logic ---
 def main():
     """ Main function to orchestrate fetching and writing pipeline data. """
@@ -339,35 +395,29 @@ def main():
             processed_project_count +=1
             print(f"  Processing Project: {project_name} (ID: {project_identifier})")
 
-            pipelines = get_pipelines(HARNESS_API_BASE_URL, headers, account_id, org_identifier, project_identifier)
-            if not pipelines:
+            pipeline_count = get_pipeline_count(HARNESS_API_BASE_URL, headers, account_id, org_identifier, project_identifier)
+
+            # Add data for this project, even if pipeline_count is 0
+            all_pipeline_data.append({
+                "Project": project_name,
+                "Organization": org_name,
+                "Pipeline Count": pipeline_count
+            })
+            processed_pipeline_count += pipeline_count # Accumulate total pipelines for summary
+
+            if pipeline_count == 0:
                 print(f"  No pipelines found in project: {project_name}.")
-                # continue # Don't skip project, just note no pipelines
+            else:
+                print(f"  Found {pipeline_count} pipelines in project: {project_name}.")
 
-            for pipeline_data in pipelines:
-                pipeline_name = pipeline_data.get("name") # The pipeline list usually has 'name' directly
-                pipeline_identifier = pipeline_data.get("identifier")
-                if not pipeline_name and pipeline_identifier: # Fallback to identifier if name is missing
-                    pipeline_name = pipeline_identifier
-                elif not pipeline_name and not pipeline_identifier:
-                    print(f"Warning: Skipping pipeline with missing name/identifier in project {project_name}. Data: {pipeline_data}")
-                    continue
-
-                processed_pipeline_count +=1
-                all_pipeline_data.append({
-                    "Project": project_name,
-                    "Organization": org_name,
-                    "Pipeline Name": pipeline_name
-                })
-                # print(f"    Added Pipeline: {pipeline_name}")
 
     print(f"\n--- Summary ---")
     print(f"Processed Organizations: {processed_org_count}")
     print(f"Processed Projects: {processed_project_count}")
-    print(f"Total Pipelines Found: {processed_pipeline_count}")
+    print(f"Total Pipelines Found across all processed projects: {processed_pipeline_count}") # Clarified summary
 
-    if not all_pipeline_data:
-        print("\nNo pipeline data collected. CSV file will not be generated.")
+    if not all_pipeline_data: # This check might be less relevant if we always add a row per project
+        print("\nNo project data collected. CSV file will not be generated.") # Adjusted message
         return
 
     # This part will be moved to a dedicated function in the next step
@@ -390,7 +440,7 @@ def write_data_to_csv(data, filename):
     try:
         with open(filename, "w", newline="", encoding="utf-8") as csvfile:
             # Define fieldnames based on the keys in our data dictionaries
-            fieldnames = ["Organization", "Project", "Pipeline Name"]
+            fieldnames = ["Organization", "Project", "Pipeline Count"] # Updated fieldname
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
             writer.writeheader()
